@@ -35,58 +35,75 @@ The long-term goal: **make AgentScope a complete, self-evolving agent runtime st
 ## 🧬 Architecture
 
 ```
-      +-------+        +-------------------------------------------+
-      | User  |<-----> | AssistantAgent (AA)                       |
-      +-------+        | - persistent memory / prompt / KB         |
-                       +--------------------+----------------------+
-                                            |
-                                            v
-                       +-------------------------------------------+
-                       | Team Planner & Delivery Evaluator         |
-                       +--------------------+----------------------+
-                                            |
-            +-------------------------------+------------------------------+
-            |                                                              |
-            v                                                              v
-+-----------------------------+                         +-------------------------------+
-| Project Context             |                         | AgentScope Agent Library      |
-| (memory, KB, MsgHub)        |<----------------------->| & Role Templates (native AS)  |
-+-----------------------------+   instantiate agents    +---------------+---------------+
-            |                                                              |
-            v                                                              v
-    +-------------------+                                +-------------------------------+
-    | Project Agents    |<----------- MsgHub ----------->| Other Project Agents          |
-    +-------------------+                                +-------------------------------+
-            |
-            v
-    Round delivery snapshot --> Planner --> AA auto-QA (>=90%?). If fail, replan; else AA ships result to user.
+                +-------+
+                | User  |
+                +-------+
+                    |
+                    v
++---------------------------------------------+
+| AssistantAgent (AA)                         |
+| - history buffer + injected resolvers       |
++------------------+--------------------------+
+                    | route / bind user
+                    v
++---------------------------------------------+
+| SystemRegistry & UserProfile store          |
++------------------+--------------------------+
+                    |
+                    v
++---------------------------------------------+
+| Assistant Orchestrator (selector + planner) |
++------------------+--------------------------+
+                    | rankings / plans
+                    v
++---------------------------------------------+      +--------------------------------+
+| TaskGraph Builder + Execution Loop          |<---->| AgentScope Agent Library / RT  |
++------------------+--------------------------+      | (native AS runtime & sandbox)  |
+                    | task status                      +--------------------------------+
+                    v
++---------------------------------------------+
+| KPI Tracker & Delivery Reporter             |
++---------------------------------------------+
+
+[Planned / partially implemented]
+- Project context persistence (ProjectPool + MemoryPool + ResourceLibrary)
+- MsgHub-based broadcast for active agents
+- Artifact-specific delivery adapters (deployments, media packaging)
 ```
 
-HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of AgentScope’s core agent abstractions (agent library, messaging, tool APIs). The runtime and sandbox execution still rely on the AgentScope runtime; HiveCore orchestrates policies, memory, and delivery logic without replacing the underlying AS environment.
+HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of AgentScope’s core agent abstractions (agent library, messaging, tool APIs). The runtime and sandbox execution still rely on the AgentScope runtime; HiveCore orchestrates policies, memory, and delivery logic without replacing the underlying AS environment. Components marked “planned” exist only as stubs today and still need real storage or orchestration wiring.
 
 ---
 
-## 🛠 Development Path
+## 🛠 Implementation Status
 
-**Completed**
-- AA foundation with persistent user memory, prompt, and private knowledge base
-- Project context initialization (memory + KB + MsgHub) so new agents inherit current progress instantly
-- Round-based planner/evaluator enforcing ≥90% delivery quality and auto replanning loops
+**Available Today**
+- AA selection + orchestration scaffolding (selector, orchestrator, task graph builder, KPI tracker).
+- SystemRegistry + UserProfile bookkeeping to bind AA instances to users (process memory only).
+- KPI tracking hooks for cost/time deltas (baseline vs observed) surfaced through AA responses.
 
-**In Progress**
-- Deeper integration with the AgentScope runtime sandbox (resource policies, execution metadata, audit hooks)
-- Artifact-specific delivery adapters (auto web deployment, media/file packaging) driven by AA
-- Plugin-friendly planner APIs and observability dashboards for runtime insight
+**Work in Progress**
+- Persistent AA memory/prompt/knowledge-base store (current implementation is in-memory only).
+- Project-level memory/knowledge base plus MsgHub orchestration wired into ExecutionLoop.
+- Round-based delivery gating with configurable ≥90% acceptance and automatic replanning loops.
+- Deeper integration with AgentScope runtime sandbox: resource policies, execution metadata, audit hooks.
+- Artifact-specific delivery adapters (auto deployments, media/file packaging) initiated from AA.
+
+**Not Started**
+- Planner observability dashboards + plugin APIs for third-party extensions.
+- Multi-project portfolio view with cross-project knowledge sync.
 
 ---
 
 ## 🔁 User Flow
 
-1. **AssistantAgent (AA) exists per user** — it is outside any single project and stores long-term memory, a dedicated prompt, and a personal knowledge base.  
-2. **Project creation seeds shared context** — every project gets its own memory store, knowledge base, and `MsgHub` broadcast pool so new agents always know the latest progress.  
-3. **AA ↔ user refinement loop** — AA co-edits requirements and delivery criteria with the user; once approved, the planner pulls suitable roles from the AgentScope agent library to form the execution team.  
-4. **Round-based work & gating** — after each batch, outputs are aggregated into a “round delivery.” AA checks against the acceptance bar (default ≥90%); if not met, the planner regenerates the plan and can swap or add agents for the next loop.  
-5. **Delivery matches the artifact** — websites get deployed with URLs returned, media assets are provided as files; AA stays accountable for “what you ask is what you receive.”
+Target flow (current prototype implements only parts of steps 1 & 3):
+
+1. **AssistantAgent (AA) exists per user** — today AA maintains an in-memory history and routes to the orchestrator; persistent memory/prompt/KB remain TODO.  
+2. **Project creation seeds shared context** — planned: per-project memory store + knowledge base + `MsgHub` to keep late-joining agents informed. (Stubs exist in `ProjectPool`/`MemoryPool` but are not wired in yet.)  
+3. **AA ↔ user refinement loop** — implemented at the planner level: AA resolves requirements via injected resolvers, then the orchestrator selects agents from the AgentScope library.  
+4. **Round-based work & gating** — planned: aggregate task outputs per round and replan if acceptance < 90%. (ExecutionLoop currently marks tasks complete without QA.)  
+5. **Delivery matches the artifact** — planned: AA triggers deployment/file-packaging adapters so the delivered artifact matches user intent.
 
 ---
 
