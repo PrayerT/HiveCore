@@ -35,40 +35,57 @@ AgentScope 已具备 Agent 定义与通信的基础能力，而 **HiveCore** 专
 ## 🧬 架构
 
 ```mermaid
-graph TD
-  subgraph User Layer
-    UI[Agent Dashboard / API]
+flowchart LR
+  User((用户))
+
+  subgraph HiveCore 定制层
+    AA[AssistantAgent (AA)\n用户级秘书\n长期记忆 + Prompt + 私有知识库]
+    Planner[团队规划器 / 交付评审器]
+    Project[(项目上下文\n项目记忆 + 知识库 + MsgHub)]
   end
 
-  subgraph HiveCore Layer
-    RUNTIME[Runtime Orchestrator]
-    SANDBOX[Per-Agent Sandbox]
-    MEMORY[Memory Manager]
-    PLUGIN[Extension Hooks]
+  subgraph AgentScope 原生能力
+    AgentLib[[Agent 库与角色模版]]
+    Agents{{项目内 Agents}}
   end
 
-  subgraph AgentScope Layer
-    AS[AgentScope Core Library]
-  end
-
-  UI --> RUNTIME
-  RUNTIME --> SANDBOX
-  SANDBOX --> MEMORY
-  MEMORY --> PLUGIN
-  PLUGIN --> AS
+  User -->|需求 / 反馈| AA
+  AA -->|澄清规格 & 交付标准| Planner
+  Planner -->|写入计划| Project
+  Planner -->|组建团队| AgentLib
+  AgentLib -->|实例化角色| Agents
+  Agents -->|通过 MsgHub 广播| Project
+  Project -->|轮次交付快照| Planner
+  Planner -->|≥ 90%?\n自动质检| AA
+  Planner -->|< 90%| Project
+  AA -->|最终交付| User
 ```
+
+HiveCore 添加的 AA、规划/验收、项目上下文与 MsgHub 等组件构建在 AgentScope 原生 Agent 抽象与消息通道之上，既保持 AS 兼容，又实现持久化秘书与项目级协同。
 
 ---
 
-## ⚙️ 核心模块
+## 🔁 用户流程
 
-| 模块 | 说明 |
-|------|------|
-| `hivecore.runtime` | 管理分布式 Agent 的执行与生命周期。 |
-| `hivecore.sandbox` | 提供隔离运行层，支持 Docker、Fargate 与本地沙箱。 |
-| `hivecore.memory` | 统一上下文记忆，兼容 PGVector、Milvus 或内存存储。 |
-| `hivecore.plugins` | 注册扩展：日志、调度器、模型路由器等。 |
-| `hivecore.api` | 通过 REST/WebSocket 暴露实时编排与监控接口。 |
+1. **AssistantAgent 面向用户长期存在**：独立于项目之外，保存用户记忆、专属 Prompt 与私有知识库，保证需求不会从零开始。  
+2. **创建项目时初始化共享上下文**：每个项目都拥有独立的记忆库、知识库与 `MsgHub` 广播池，后续加入的 Agent 也能即时了解进度。  
+3. **AA 与用户循环打磨需求**：AA 与用户共同完善需求与验收标准，经确认后由规划器从 AgentScope Agent 库挑选合适角色，组队后开始执行。  
+4. **按轮次交付并校验**：每一批任务形成“轮次交付”，AA 根据约定标准（默认 ≥90%）验收；若未达标，规划器会重新制订计划，并可替换/新增 Agent 进入下一轮。  
+5. **交付结果即所得**：若用户要网站则完成部署并返回 URL；若要视频/素材则直接提供文件，AA 作为唯一接口确保“所求即所得”。  
+
+---
+
+## ⚙️ 能力归属：AgentScope vs HiveCore
+
+| 能力 | AgentScope 原生 | HiveCore 定制 |
+|------|----------------|---------------|
+| Agent 抽象、工具调用、基础消息通道 | ✅ | 作为底座复用 |
+| AssistantAgent 人设 + 用户级记忆/Prompt/知识库 | — | ✅ |
+| 项目级记忆、知识库与 MsgHub 广播池 | ⚙️ 基础数据接口 | ✅ 强化编排 |
+| 团队规划器与交付评审（≥90% 阈值、返工循环） | — | ✅ |
+| Agent 库与角色模版 | ✅ | ✅ 增补领域模版 |
+| 运行时沙箱编排（Docker/Fargate/本地） | 能力有限 | ✅ 自研层 |
+| REST/WebSocket 控制面 | ✅ | ✅ 补充端点 |
 
 ---
 

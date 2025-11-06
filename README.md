@@ -35,40 +35,57 @@ The long-term goal: **make AgentScope a complete, self-evolving agent runtime st
 ## 🧬 Architecture
 
 ```mermaid
-graph TD
-  subgraph User Layer
-    UI[Agent Dashboard / API]
+flowchart LR
+  User((User))
+
+  subgraph HiveCore Customization
+    AA[AssistantAgent (AA)\nUser-level concierge\nPersistent memory + prompt + KB]
+    Planner[Team Planner & Delivery Evaluator]
+    Project[(Project Context\nProject Memory + KB + MsgHub)]
   end
 
-  subgraph HiveCore Layer
-    RUNTIME[Runtime Orchestrator]
-    SANDBOX[Per-Agent Sandbox]
-    MEMORY[Memory Manager]
-    PLUGIN[Extension Hooks]
+  subgraph AgentScope Native
+    AgentLib[[Agent Library & Role Templates]]
+    Agents{{Project Agents}}
   end
 
-  subgraph AgentScope Layer
-    AS[AgentScope Core Library]
-  end
-
-  UI --> RUNTIME
-  RUNTIME --> SANDBOX
-  SANDBOX --> MEMORY
-  MEMORY --> PLUGIN
-  PLUGIN --> AS
+  User -->|requirements / feedback| AA
+  AA -->|clarify specs & delivery bar| Planner
+  Planner -->|persist plans| Project
+  Planner -->|team assembly| AgentLib
+  AgentLib -->|instantiate roles| Agents
+  Agents -->|broadcast via MsgHub| Project
+  Project -->|round delivery snapshot| Planner
+  Planner -->|>= 90%?\nAuto QA| AA
+  Planner -->|< 90%| Project
+  AA -->|ship final deliverable| User
 ```
+
+HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of AgentScope’s core agent abstractions and message channels, letting us keep AS compatibility while adding persistent assistants and project-scoped collaboration.
 
 ---
 
-## ⚙️ Core Modules
+## 🔁 User Flow
 
-| Module | Description |
-|--------|--------------|
-| `hivecore.runtime` | Manages distributed agent execution and lifecycle control. |
-| `hivecore.sandbox` | Isolated runtime layer; supports Docker, Fargate, and local sandboxes. |
-| `hivecore.memory` | Unified context memory — supports PGVector, Milvus, or in-memory store. |
-| `hivecore.plugins` | Register extensions: loggers, schedulers, model routers, etc. |
-| `hivecore.api` | REST/WebSocket interface for real-time orchestration and monitoring. |
+1. **AssistantAgent (AA) exists per user** — it is outside any single project and stores long-term memory, a dedicated prompt, and a personal knowledge base.  
+2. **Project creation seeds shared context** — every project gets its own memory store, knowledge base, and `MsgHub` broadcast pool so new agents always know the latest progress.  
+3. **AA ↔ user refinement loop** — AA co-edits requirements and delivery criteria with the user; once approved, the planner pulls suitable roles from the AgentScope agent library to form the execution team.  
+4. **Round-based work & gating** — after each batch, outputs are aggregated into a “round delivery.” AA checks against the acceptance bar (default ≥90%); if not met, the planner regenerates the plan and can swap or add agents for the next loop.  
+5. **Delivery matches the artifact** — websites get deployed with URLs returned, media assets are provided as files; AA stays accountable for “what you ask is what you receive.”
+
+---
+
+## ⚙️ Capabilities: AgentScope vs HiveCore
+
+| Capability | AgentScope Native | HiveCore Customization |
+|------------|------------------|------------------------|
+| Agent abstractions, tool calling, base messaging | ✅ | Uses as foundation |
+| AssistantAgent persona with persistent user memory/prompt/KB | — | ✅ |
+| Project-level memory, knowledge base, MsgHub broadcast pool | ⚙️ basic data hooks | ✅ enriched orchestration |
+| Team planner & delivery evaluator (≥90% gating, replan loop) | — | ✅ |
+| Agent library & role templates | ✅ | ✅ extended with domain presets |
+| Runtime sandbox orchestration (Docker/Fargate/local) | Limited | ✅ dedicated layer |
+| REST/WebSocket control plane | ✅ | ✅ additional endpoints |
 
 ---
 
