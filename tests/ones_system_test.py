@@ -113,3 +113,57 @@ def test_end_to_end_cycle() -> None:
     summary = build_summary(profile, kpi_tracker, question_tracker)
     assert summary.overview.startswith("Project One·s")
     assert summary.unresolved_questions == 0
+
+
+def test_round_persistence_and_replan(tmp_path) -> None:
+    registry = SystemRegistry()
+    orchestrator = AssistantOrchestrator(system_registry=registry)
+    orchestrator.register_candidates(
+        "Dev",
+        [
+            AgentProfile(
+                agent_id="dev-round",
+                name="dev-round",
+                role="Dev",
+                static_score=StaticScore(performance=0.8, brand=0.7, recognition=0.75),
+                capabilities=AgentCapabilities(skills={"python"}, tools={"docker"}),
+            ),
+        ],
+    )
+
+    intent = IntentRequest(
+        user_id="u-round",
+        utterance="需要多轮次交付",
+        role_requirements={
+            "task-1": RoleRequirement(role="Dev", skills={"python"}, tools={"docker"}),
+        },
+    )
+    acceptance = AcceptanceCriteria(description="Quality", metrics={"quality": 0.8})
+
+    project_pool = ProjectPool()
+    memory_pool = MemoryPool()
+    resource_library = ResourceLibrary()
+    executor = ExecutionLoop(
+        project_pool=project_pool,
+        memory_pool=memory_pool,
+        resource_library=resource_library,
+        orchestrator=orchestrator,
+        task_graph_builder=TaskGraphBuilder(),
+        kpi_tracker=KPITracker(target_reduction=0.9),
+        max_rounds=2,
+    )
+
+    report = executor.run_cycle(
+        intent,
+        acceptance,
+        baseline_cost=100,
+        observed_cost=400,
+        baseline_time=80,
+        observed_time=200,
+    )
+
+    assert report.accepted is True
+    project_id = report.project_id
+    assert project_id is not None
+    round_entries = memory_pool.query_by_tag(f"project:{project_id}")
+    assert len(round_entries) == 2

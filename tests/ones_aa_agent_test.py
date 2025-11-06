@@ -17,6 +17,7 @@ from agentscope.ones import (
     ExecutionLoop,
 )
 from agentscope.ones.memory import ResourceHandle
+from agentscope.ones.storage import AAMemoryStore
 import pytest
 
 
@@ -94,3 +95,44 @@ async def test_aa_agent_reply_generates_summary() -> None:
     text = response.get_text_content()
     assert text is not None and "proj-aa" in text
     assert "task-1" in text
+
+
+@pytest.mark.asyncio
+async def test_aa_agent_persists_conversation(tmp_path) -> None:
+    registry = SystemRegistry()
+    orchestrator = AssistantOrchestrator(system_registry=registry)
+    orchestrator.register_candidates("Dev", [_mock_agent("dev-aa")])
+
+    memory_store = AAMemoryStore(path=tmp_path / "aa.json")
+    project_pool = ProjectPool()
+    memory_pool = MemoryPool()
+    resource_library = ResourceLibrary()
+    execution_loop = ExecutionLoop(
+        project_pool=project_pool,
+        memory_pool=memory_pool,
+        resource_library=resource_library,
+        orchestrator=orchestrator,
+        task_graph_builder=TaskGraphBuilder(),
+        kpi_tracker=KPITracker(target_reduction=0.1),
+    )
+
+    agent = AASystemAgent(
+        name="AA",
+        user_id="u-memory",
+        orchestrator=orchestrator,
+        execution_loop=execution_loop,
+        requirement_resolver=lambda _: {
+            "task-1": RoleRequirement(role="Dev", skills={"python"})
+        },
+        acceptance_resolver=lambda _: AcceptanceCriteria(description="q", metrics={"quality": 0.5}),
+        metrics_resolver=lambda _: (100.0, 120.0, 50.0, 60.0),
+        memory_store=memory_store,
+    )
+
+    msg = Msg(name="user", role="user", content="测试持久化")
+    await agent.reply(msg)
+
+    record = memory_store.load("u-memory")
+    assert record.conversation_log
+    roles = {entry["role"] for entry in record.conversation_log}
+    assert "user" in roles and "assistant" in roles

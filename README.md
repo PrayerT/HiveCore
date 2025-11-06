@@ -42,7 +42,7 @@ The long-term goal: **make AgentScope a complete, self-evolving agent runtime st
                     v
 +---------------------------------------------+
 | AssistantAgent (AA)                         |
-| - history buffer + injected resolvers       |
+| - persistent memory store + resolvers       |
 +------------------+--------------------------+
                     | route / bind user
                     v
@@ -66,7 +66,6 @@ The long-term goal: **make AgentScope a complete, self-evolving agent runtime st
 +---------------------------------------------+
 
 [Planned / partially implemented]
-- Project context persistence (ProjectPool + MemoryPool + ResourceLibrary)
 - MsgHub-based broadcast for active agents
 - Artifact-specific delivery adapters (deployments, media packaging)
 ```
@@ -79,14 +78,15 @@ HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of A
 
 **Available Today**
 - AA selection + orchestration scaffolding (selector, orchestrator, task graph builder, KPI tracker).
-- SystemRegistry + UserProfile bookkeeping to bind AA instances to users (process memory only).
+- Persistent AA memory store (`AAMemoryStore`) that records prompts, knowledge entries, and full conversation logs per user.
+- SystemRegistry + UserProfile bookkeeping to bind AA instances to users (and auto-bootstrap from the memory store).
+- Project-level context snapshots via `ProjectPool` + `MemoryPool` plus per-round summaries saved for any project the AA spins up.
+- Multi-round delivery gating: ExecutionLoop evaluates ≥90% quality, persists each round, and automatically replans/retries with improved metrics.
 - KPI tracking hooks for cost/time deltas (baseline vs observed) surfaced through AA responses.
 
 **Work in Progress**
-- Persistent AA memory/prompt/knowledge-base store (current implementation is in-memory only).
-- Project-level memory/knowledge base plus MsgHub orchestration wired into ExecutionLoop.
-- Round-based delivery gating with configurable ≥90% acceptance and automatic replanning loops.
-- Deeper integration with AgentScope runtime sandbox: resource policies, execution metadata, audit hooks.
+- MsgHub broadcast integration that connects the stored round summaries to live agent participants.
+- Deeper integration with the AgentScope runtime sandbox: resource policies, execution metadata, audit hooks.
 - Artifact-specific delivery adapters (auto deployments, media/file packaging) initiated from AA.
 
 **Not Started**
@@ -97,13 +97,13 @@ HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of A
 
 ## 🔁 User Flow
 
-Target flow (current prototype implements only parts of steps 1 & 3):
+Target flow (now partially implemented with persistent memory + round gating):
 
-1. **AssistantAgent (AA) exists per user** — today AA maintains an in-memory history and routes to the orchestrator; persistent memory/prompt/KB remain TODO.  
-2. **Project creation seeds shared context** — planned: per-project memory store + knowledge base + `MsgHub` to keep late-joining agents informed. (Stubs exist in `ProjectPool`/`MemoryPool` but are not wired in yet.)  
-3. **AA ↔ user refinement loop** — implemented at the planner level: AA resolves requirements via injected resolvers, then the orchestrator selects agents from the AgentScope library.  
-4. **Round-based work & gating** — planned: aggregate task outputs per round and replan if acceptance < 90%. (ExecutionLoop currently marks tasks complete without QA.)  
-5. **Delivery matches the artifact** — planned: AA triggers deployment/file-packaging adapters so the delivered artifact matches user intent.
+1. **AssistantAgent (AA) exists per user** — AA now loads/saves long-term memory (prompt + knowledge + dialogue) through `AAMemoryStore`, so every conversation turn is persisted beyond process restarts.  
+2. **Project creation seeds shared context** — ExecutionLoop auto-registers projects, stores per-round summaries in `MemoryPool`, and exposes them through project tags; MsgHub live broadcast is still on the roadmap.  
+3. **AA ↔ user refinement loop** — implemented: AA resolves requirements via injected resolvers, orchestrator selects agents from the AgentScope library, and user preferences from the memory store feed into the planner.  
+4. **Round-based work & gating** — implemented: every round records KPI + task status, evaluates against the ≥90% quality bar, and triggers replanning until either accepted or max rounds reached.  
+5. **Delivery matches the artifact** — planned: AA will call artifact-specific adapters (deployment, media packaging) so the final asset matches user intent exactly.
 
 ---
 

@@ -29,6 +29,7 @@ from .kpi import KPITracker, KPIRecord
 from .questions import OpenQuestion, OpenQuestionTracker
 from .summary import SummaryReport, build_summary
 from .aa_agent import AASystemAgent
+from .storage import AAMemoryRecord, AAMemoryStore
 from .react_agents import (
     SpecialistReActAgent,
     StrategyReActAgent,
@@ -69,6 +70,8 @@ __all__ = [
     "ExecutionLoop",
     "ExecutionReport",
     "AASystemAgent",
+    "AAMemoryRecord",
+    "AAMemoryStore",
     "SpecialistReActAgent",
     "StrategyReActAgent",
     "BuilderReActAgent",

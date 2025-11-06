@@ -42,7 +42,7 @@ AgentScope 已具备 Agent 定义与通信的基础能力，而 **HiveCore** 专
                     v
 +---------------------------------------------+
 | AssistantAgent (AA)                         |
-| - 历史对话缓存 + 外部 resolver              |
+| - 持久化记忆存储 + 外部 resolver            |
 +------------------+--------------------------+
                     | 绑定 / 路由用户
                     v
@@ -66,7 +66,6 @@ AgentScope 已具备 Agent 定义与通信的基础能力，而 **HiveCore** 专
 +---------------------------------------------+
 
 [计划中 / 部分实现]
-- 项目上下文持久化（ProjectPool + MemoryPool + ResourceLibrary）
 - 基于 MsgHub 的 Agent 广播编排
 - 面向制品的交付适配器（部署、媒体打包等）
 ```
@@ -79,13 +78,14 @@ HiveCore 添加的 AA、规划/验收、项目上下文与 MsgHub 等组件构�
 
 **当前可用**
 - AA 选型 + 编排骨架（selector、orchestrator、task graph builder、KPI tracker）。
-- SystemRegistry + UserProfile 映射（仅进程内存储）用于绑定用户与 AA。
+- `AAMemoryStore` 持久化保存用户 Prompt、知识条目与完整对话记录，可在多轮会话中复用。
+- SystemRegistry + UserProfile 映射并可基于记忆库自动装配用户绑定关系。
+- ExecutionLoop 自动注册项目、写入 `MemoryPool` 的轮次摘要，供新增 Agent 即时读取。
+- ≥90% 验收阈值的轮次交付：每轮记录 KPI + 任务状态，未达标会自动重规划并重试。
 - KPI 记录能力，可在 AA 回复中输出成本/时长对比。
 
 **进行中**
-- AA 的持久化记忆 / Prompt / 知识库（目前仅内存缓冲）。
-- 项目级记忆 / 知识库与 MsgHub 编排在 ExecutionLoop 中的真实落地。
-- ≥90% 可配置验收阈值与自动返工循环的轮次交付机制。
+- 将轮次摘要与实时 MsgHub 广播联动，供在线 Agent 共享上下文。
 - 与 AgentScope runtime 沙箱更深度的联动：资源策略、执行元数据、审计挂钩。
 - 面向制品的交付适配器（自动部署站点、媒体/文件打包），由 AA 统一触发。
 
@@ -97,13 +97,13 @@ HiveCore 添加的 AA、规划/验收、项目上下文与 MsgHub 等组件构�
 
 ## 🔁 用户流程
 
-以下为目标流程（当前原型仅覆盖第 1、3 步的部分能力）：
+以下为目标流程（现已部分实现：持久记忆 + 轮次验收）：
 
-1. **AssistantAgent 面向用户长期存在**：现阶段只在内存中保存会话历史并路由到 orchestrator，持久记忆 / Prompt / 私有知识库尚未落地。  
-2. **创建项目时初始化共享上下文**：规划中；`ProjectPool` / `MemoryPool` / `ResourceLibrary` 已有桩代码，但未与 ExecutionLoop / MsgHub 真正打通。  
-3. **AA 与用户循环打磨需求**：已在规划层实现，AA 通过外部 resolver 解析需求，orchestrator 从 AgentScope Agent 库评估并组建团队。  
-4. **按轮次交付并校验**：规划中；ExecutionLoop 目前只模拟任务完成，尚未具备 ≥90% 验收与返工循环。  
-5. **交付结果即所得**：规划中；后续将通过交付适配器实现自动部署或文件打包。  
+1. **AssistantAgent 面向用户长期存在**：AA 通过 `AAMemoryStore` 将 Prompt、知识、完整对话落盘，进程重启也能延续上下文。  
+2. **创建项目时初始化共享上下文**：ExecutionLoop 自动注册项目，并把每轮摘要写入 `MemoryPool`（MsgHub 在线广播仍在开发中）。  
+3. **AA 与用户循环打磨需求**：已在规划层实现，AA 通过 resolver 解析需求，orchestrator 从 AgentScope Agent 库评估并组建团队，同时可利用记忆库中的偏好。  
+4. **按轮次交付并校验**：已实现，ExecutionLoop 记录每轮 KPI 与任务状态，按 ≥90% 阈值验收，未通过则自动 replanning + 再执行。  
+5. **交付结果即所得**：规划中；将通过交付适配器实现自动部署或文件打包。  
 
 ---
 

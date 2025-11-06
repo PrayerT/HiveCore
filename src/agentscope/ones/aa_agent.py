@@ -10,6 +10,7 @@ from ..aa import RoleRequirement
 from .execution import ExecutionLoop
 from .intent import AcceptanceCriteria, AssistantOrchestrator, IntentRequest
 from ._system import UserProfile
+from .storage import AAMemoryStore
 
 RequirementResolver = Callable[[str], dict[str, RoleRequirement]]
 AcceptanceResolver = Callable[[str], AcceptanceCriteria]
@@ -36,6 +37,8 @@ class AASystemAgent(AgentBase):
         metrics_resolver: MetricsResolver | None = None,
         project_resolver: ProjectResolver | None = None,
         user_profile: UserProfile | None = None,
+        memory_store: AAMemoryStore | None = None,
+        initial_prompt: str | None = None,
     ) -> None:
         super().__init__()
         self.name = name
@@ -47,6 +50,12 @@ class AASystemAgent(AgentBase):
         self.metrics_resolver = metrics_resolver or _default_metrics
         self.project_resolver = project_resolver or (lambda _: None)
         self._history: list[Msg] = []
+        self.memory_store = memory_store
+        if self.memory_store is not None:
+            record = self.memory_store.load(user_id)
+            if initial_prompt:
+                record.prompt = initial_prompt
+                self.memory_store.save(record)
 
         if user_profile is not None:
             self.orchestrator.route_user(user_profile)
@@ -58,6 +67,12 @@ class AASystemAgent(AgentBase):
             self._history.extend(msg)
         else:
             self._history.append(msg)
+        if self.memory_store is not None and msg is not None:
+            messages = msg if isinstance(msg, list) else [msg]
+            for item in messages:
+                text = item.get_text_content()
+                if text:
+                    self.memory_store.append(self.user_id, item.role or "unknown", text)
 
     def _ensure_messages(
         self,
@@ -86,6 +101,8 @@ class AASystemAgent(AgentBase):
         )
 
     async def reply(self, msg: Msg | list[Msg] | None = None, **kwargs) -> Msg:
+        if msg is not None:
+            await self.observe(msg)
         messages = self._ensure_messages(msg)
         if not messages:
             raise ValueError("AA agent requires at least one message to reply")
@@ -132,5 +149,7 @@ class AASystemAgent(AgentBase):
             content=[TextBlock(type="text", text=content)],
             metadata=metadata,
         )
+        if self.memory_store is not None:
+            self.memory_store.append(self.user_id, response.role, content)
         await self.observe(response)
         return response
