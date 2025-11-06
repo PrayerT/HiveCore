@@ -34,34 +34,35 @@ The long-term goal: **make AgentScope a complete, self-evolving agent runtime st
 
 ## 🧬 Architecture
 
-```mermaid
-flowchart LR
-  User((User))
-
-  subgraph HiveCore Customization
-    AA[AssistantAgent (AA)<br/>User-level concierge<br/>Persistent memory + prompt + KB]
-    Planner[Team Planner & Delivery Evaluator]
-    Project[(Project Context<br/>Project Memory + KB + MsgHub)]
-  end
-
-  subgraph AgentScope Native
-    AgentLib[[Agent Library & Role Templates]]
-    Agents{{Project Agents}}
-  end
-
-  User -->|requirements / feedback| AA
-  AA -->|clarify specs & delivery bar| Planner
-  Planner -->|persist plans| Project
-  Planner -->|team assembly| AgentLib
-  AgentLib -->|instantiate roles| Agents
-  Agents -->|broadcast via MsgHub| Project
-  Project -->|round delivery snapshot| Planner
-  Planner -->|>= 90%?<br/>Auto QA| AA
-  Planner -->|< 90%| Project
-  AA -->|ship final deliverable| User
+```
+      +-------+        +-------------------------------------------+
+      | User  |<-----> | AssistantAgent (AA)                       |
+      +-------+        | - persistent memory / prompt / KB         |
+                       +--------------------+----------------------+
+                                            |
+                                            v
+                       +-------------------------------------------+
+                       | Team Planner & Delivery Evaluator         |
+                       +--------------------+----------------------+
+                                            |
+            +-------------------------------+------------------------------+
+            |                                                              |
+            v                                                              v
++-----------------------------+                         +-------------------------------+
+| Project Context             |                         | AgentScope Agent Library      |
+| (memory, KB, MsgHub)        |<----------------------->| & Role Templates (native AS)  |
++-----------------------------+   instantiate agents    +---------------+---------------+
+            |                                                              |
+            v                                                              v
+    +-------------------+                                +-------------------------------+
+    | Project Agents    |<----------- MsgHub ----------->| Other Project Agents          |
+    +-------------------+                                +-------------------------------+
+            |
+            v
+    Round delivery snapshot --> Planner --> AA auto-QA (>=90%?). If fail, replan; else AA ships result to user.
 ```
 
-HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of AgentScope’s core agent abstractions and message channels, letting us keep AS compatibility while adding persistent assistants and project-scoped collaboration.
+HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of AgentScope’s core agent abstractions (agent library, messaging, tool APIs), so we stay AS-compatible while adding persistent assistants and project-scoped collaboration.
 
 ---
 
