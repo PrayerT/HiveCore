@@ -39,9 +39,9 @@ flowchart LR
   User((用户))
 
   subgraph HiveCore 定制层
-    AA[AssistantAgent (AA)\n用户级秘书\n长期记忆 + Prompt + 私有知识库]
+    AA[AssistantAgent (AA)<br/>用户级秘书<br/>长期记忆 + Prompt + 私有知识库]
     Planner[团队规划器 / 交付评审器]
-    Project[(项目上下文\n项目记忆 + 知识库 + MsgHub)]
+    Project[(项目上下文<br/>项目记忆 + 知识库 + MsgHub)]
   end
 
   subgraph AgentScope 原生能力
@@ -56,7 +56,7 @@ flowchart LR
   AgentLib -->|实例化角色| Agents
   Agents -->|通过 MsgHub 广播| Project
   Project -->|轮次交付快照| Planner
-  Planner -->|≥ 90%?\n自动质检| AA
+  Planner -->|≥ 90%?<br/>自动质检| AA
   Planner -->|< 90%| Project
   AA -->|最终交付| User
 ```

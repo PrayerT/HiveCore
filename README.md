@@ -39,9 +39,9 @@ flowchart LR
   User((User))
 
   subgraph HiveCore Customization
-    AA[AssistantAgent (AA)\nUser-level concierge\nPersistent memory + prompt + KB]
+    AA[AssistantAgent (AA)<br/>User-level concierge<br/>Persistent memory + prompt + KB]
     Planner[Team Planner & Delivery Evaluator]
-    Project[(Project Context\nProject Memory + KB + MsgHub)]
+    Project[(Project Context<br/>Project Memory + KB + MsgHub)]
   end
 
   subgraph AgentScope Native
@@ -56,7 +56,7 @@ flowchart LR
   AgentLib -->|instantiate roles| Agents
   Agents -->|broadcast via MsgHub| Project
   Project -->|round delivery snapshot| Planner
-  Planner -->|>= 90%?\nAuto QA| AA
+  Planner -->|>= 90%?<br/>Auto QA| AA
   Planner -->|< 90%| Project
   AA -->|ship final deliverable| User
 ```
