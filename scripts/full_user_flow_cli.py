@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-CLI 演示：使用 SiliconFlow OpenAI 兼容接口走完 HiveCore 用户流程。
+HiveCore CLI：真实 LLM 多 Agent 协作流程演示
 
-步骤：
-1. 读取 `~/agentscope/.env` 获取 SILICONFLOW_* 配置。
-2. 调用大模型与用户多轮对话，直到生成结构化需求与验收标准。
-3. 将需求映射到 HiveCore 的 `AASystemAgent` + `ExecutionLoop`，自动组建团队并运行多轮交付。
-4. 输出每轮广播、最终交付链接以及 AA 的验收回复。
+特性
+-----
+- 自动读取 `~/agentscope/.env` 中的 SILICONFLOW_* 配置，调用硅基流动 OpenAI 兼容接口。
+- AA 通过多轮追问补齐需求，输出包含细粒度验收标准的 JSON。
+- Planner / Designer / Developer / QA 四个 LLM Agent 共享上下文，协同产出与评审。
+- QA 按照 “通过条数/总条数” 计算验收质量；若未达阈值会带着反馈进入下一轮迭代。
+- 全部文案、任务、交付和验收结论均由 LLM 实时生成，无任何写死数据。
 """
 from __future__ import annotations
 
@@ -15,50 +17,25 @@ import asyncio
 import json
 import os
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Sequence
 
-from agentscope.aa import AgentCapabilities, AgentProfile, RoleRequirement, StaticScore
-from agentscope.message import Msg, TextBlock
 from agentscope.model import OpenAIChatModel
-from agentscope.ones import (
-    AAMemoryStore,
-    AASystemAgent,
-    AcceptanceCriteria,
-    ArtifactDeliveryManager,
-    CollaborationLayer,
-    ExecutionLoop,
-    ExperienceLayer,
-    InMemoryMsgHub,
-    IntentLayer,
-    KPITracker,
-    MediaPackageAdapter,
-    MemoryPool,
-    OpenQuestionTracker,
-    ProjectDescriptor,
-    ProjectPool,
-    ResourceLibrary,
-    SlaLayer,
-    SupervisionLayer,
-    SystemMission,
-    SystemProfile,
-    SystemRegistry,
-    TaskGraphBuilder,
-    UserProfile,
-    WebDeployAdapter,
-    AssistantOrchestrator,
-)
 
+
+# ---------------------------------------------------------------------------
+# 环境与 LLM 辅助
+# ---------------------------------------------------------------------------
 
 def load_siliconflow_env() -> dict[str, str]:
-    """Load SiliconFlow credentials from ~/agentscope/.env (if present)."""
+    """Load SiliconFlow credentials from ~/agentscope/.env."""
     env_path = Path.home() / "agentscope" / ".env"
     if env_path.exists():
         with env_path.open(encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
+                if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, value = line.split("=", 1)
                 os.environ.setdefault(key.strip(), value.strip())
@@ -73,147 +50,305 @@ def load_siliconflow_env() -> dict[str, str]:
     }
 
 
+async def call_llm_text(
+    llm: OpenAIChatModel,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    temperature: float = 0.3,
+) -> str:
+    """Call LLM and return plain text content."""
+    resp = await llm(
+        [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": user_prompt.strip()},
+        ],
+        stream=False,
+        temperature=temperature,
+    )
+    text = "".join(
+        block.get("text", "")
+        for block in resp.content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    return text.strip()
+
+
+def extract_json_block(text: str) -> str:
+    """Extract JSON substring from text."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("未找到 JSON 区块")
+    return text[start : end + 1]
+
+
+# ---------------------------------------------------------------------------
+# 需求澄清阶段
+# ---------------------------------------------------------------------------
+
 async def gather_spec(
     llm: OpenAIChatModel,
     initial_requirement: str,
     scripted_answers: list[str] | None = None,
-) -> dict:
-    """Use the LLM to iteratively collect requirement spec."""
+) -> dict[str, Any]:
+    """Iteratively clarify requirements and return structured spec."""
     system_prompt = textwrap.dedent(
         """
-        你是 HiveCore 的 AssistantAgent。与用户多轮对话，逐步完善项目需求。
-        当你需要更多信息时，请提出一个具体问题。
-        当你觉得信息足够时，请输出:
-        READY::{"project_name": "...","summary": "...","requirements":[{"id":"task-1","role":"Planner","skills":["planning"],"tools":["notion"],"description":"..."}],"acceptance":{"quality":0.85},"artifact_type":"web"}
-        JSON 中不要出现换行或注释。
+        你是 HiveCore 的 AssistantAgent，需与用户多轮对话收集需求。
+        如果信息不足，请提出一个问题；如果足够，请输出：
+        READY::{"project_name": "...","summary": "...",
+                 "requirements":[{"id":"task-1","role":"Planner",
+                                  "skills":["planning"],"tools":["figma"],
+                                  "goal":"..."}],
+                 "acceptance":{"criteria":[
+                    {"name":"内容深度","description":"...","target":0.9},
+                    {"name":"报名字段完整","description":"...","target":1.0}
+                 ],"overall_target":0.9},
+                 "artifact_type":"web"}
+        JSON 必须有效、紧凑且不含注释。
         """
     ).strip()
     conversation = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": initial_requirement},
     ]
-    print("\nAA: 已记录初始需求，我将提出问题来澄清细节。")
+    print("\nAA: 已记录初始需求，开始澄清。")
     while True:
         response = await llm(conversation, stream=False, temperature=0.2)
         text = "".join(
             block.get("text", "")
             for block in response.content
-            if block.get("type") == "text"
+            if isinstance(block, dict) and block.get("type") == "text"
         ).strip()
         conversation.append({"role": "assistant", "content": text})
         if text.startswith("READY::"):
             payload = text.split("READY::", 1)[1].strip()
             spec = json.loads(payload)
-            print("AA: 需求已完善，开始进入执行阶段。")
+            print("AA: 需求收集完成。")
             return spec
         print(f"AA: {text}")
         if scripted_answers:
             user_reply = scripted_answers.pop(0)
             print(f"用户(自动): {user_reply}")
         else:
-            user_reply = input("用户: ").strip()
-            if not user_reply:
-                user_reply = "先按你的理解继续。"
+            user_reply = input("用户: ").strip() or "请继续完善。"
         conversation.append({"role": "user", "content": user_reply})
 
 
-def build_requirements(spec: dict) -> dict[str, RoleRequirement]:
-    requirements: dict[str, RoleRequirement] = {}
-    for item in spec.get("requirements", []):
-        node_id = item.get("id") or f"task-{len(requirements) + 1}"
-        role = item.get("role", "Dev")
-        requirements[node_id] = RoleRequirement(
-            role=role,
-            skills=set(item.get("skills", [])),
-            tools=set(item.get("tools", [])),
-            domains=set(item.get("domains", [])),
-            languages=set(item.get("languages", [])),
+# ---------------------------------------------------------------------------
+# 多 Agent 协作
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentOutput:
+    role: str
+    content: str
+
+
+async def planner_agent(llm: OpenAIChatModel, spec: dict, feedback: str) -> AgentOutput:
+    prompt = textwrap.dedent(
+        f"""
+        需求摘要:
+        {json.dumps(spec, ensure_ascii=False, indent=2)}
+
+        前一轮 QA 反馈（如有）:
+        {feedback or "无"}
+
+        任务:
+        - 拆解为 3-5 个明确可执行的任务节点，涵盖文案/视觉/开发。
+        - 说明每个任务的负责人、输入、输出。
+        - 使用 Markdown bullet 列表。
+        """
+    )
+    content = await call_llm_text(
+        llm,
+        "你是项目规划师，擅长将需求拆解为可执行任务。",
+        prompt,
+        temperature=0.3,
+    )
+    return AgentOutput("Planner", content)
+
+
+async def designer_agent(
+    llm: OpenAIChatModel,
+    spec: dict,
+    planner_notes: str,
+    feedback: str,
+) -> AgentOutput:
+    prompt = textwrap.dedent(
+        f"""
+        参考需求与 Planner 任务:
+        {planner_notes}
+
+        具体要求:
+        - 生成新品官网的文案结构 (Hero / 核心卖点 / 报名区域)。
+        - 以 Markdown 标题 + 列表形式输出，给出 CTA 文案。
+        - 若 QA 有反馈，请对相应部分做出改进: {feedback or "无"}。
+        """
+    )
+    content = await call_llm_text(
+        llm,
+        "你是资深 UX / 内容设计师，负责撰写网站文案与结构。",
+        prompt,
+        temperature=0.4,
+    )
+    return AgentOutput("Designer", content)
+
+
+async def developer_agent(
+    llm: OpenAIChatModel,
+    spec: dict,
+    planner_notes: str,
+    designer_notes: str,
+    feedback: str,
+) -> AgentOutput:
+    prompt = textwrap.dedent(
+        f"""
+        需求和规划:
+        {planner_notes}
+
+        文案与结构:
+        {designer_notes}
+
+        任务:
+        - 输出页面信息架构与组件清单（section、模块、表单字段）。
+        - 给出实现建议（如技术栈、组件划分）。
+        - 若 QA 有反馈，请重点解决: {feedback or "无"}。
+        - 使用 Markdown，有条理地展示。
+        """
+    )
+    content = await call_llm_text(
+        llm,
+        "你是全栈实现负责，需将方案转为可执行实现计划。",
+        prompt,
+        temperature=0.35,
+    )
+    return AgentOutput("Developer", content)
+
+
+async def qa_agent(
+    llm: OpenAIChatModel,
+    spec: dict,
+    deliverable: str,
+    round_index: int,
+) -> dict[str, Any]:
+    acceptance = spec.get("acceptance", {})
+    criteria = acceptance.get("criteria") or [
+        {"name": "整体质量", "description": spec.get("summary", ""), "target": 0.9},
+    ]
+    prompt = textwrap.dedent(
+        f"""
+        验收标准 (JSON):
+        {json.dumps(criteria, ensure_ascii=False, indent=2)}
+
+        交付物 (Round {round_index}):
+        {deliverable}
+
+        请严格按照以下 JSON 格式输出：
+        {{
+          "round": {round_index},
+          "criteria": [
+            {{"name": "...", "pass": true/false, "reason": "...", "recommendation": "..."}}
+          ]
+        }}
+        不要输出额外文本。
+        """
+    )
+    raw = await call_llm_text(
+        llm,
+        "你是严格的 QA，需要逐条核对并返回 JSON 结果。",
+        prompt,
+        temperature=0.2,
+    )
+    try:
+        data = json.loads(extract_json_block(raw))
+    except Exception as exc:  # pragma: no cover - fallback parsing
+        raise RuntimeError(f"QA 输出无法解析为 JSON:\n{raw}") from exc
+    return data
+
+
+async def run_collaboration(
+    llm: OpenAIChatModel,
+    spec: dict,
+    *,
+    max_rounds: int = 3,
+) -> dict[str, Any]:
+    """Run multi-agent collaboration rounds until acceptance met."""
+    rounds: list[dict[str, Any]] = []
+    feedback = ""
+    overall_target = spec.get("acceptance", {}).get("overall_target", 0.9)
+
+    for round_index in range(1, max_rounds + 1):
+        print(f"\n---- Round {round_index} ----")
+
+        planner_output = await planner_agent(llm, spec, feedback)
+        print("\n[Planner]\n", planner_output.content)
+
+        designer_output = await designer_agent(llm, spec, planner_output.content, feedback)
+        print("\n[Designer]\n", designer_output.content)
+
+        developer_output = await developer_agent(
+            llm,
+            spec,
+            planner_output.content,
+            designer_output.content,
+            feedback,
         )
-    if not requirements:
-        requirements["task-1"] = RoleRequirement(
-            role="Dev",
-            skills={"python"},
-            tools={"docker"},
+        print("\n[Developer]\n", developer_output.content)
+
+        qa_data = await qa_agent(llm, spec, developer_output.content, round_index)
+        criteria = qa_data.get("criteria", [])
+        passed = sum(1 for item in criteria if item.get("pass"))
+        total = max(len(criteria), 1)
+        pass_ratio = passed / total
+
+        rounds.append(
+            {
+                "round": round_index,
+                "planner": planner_output.content,
+                "designer": designer_output.content,
+                "developer": developer_output.content,
+                "qa": qa_data,
+                "pass_ratio": pass_ratio,
+                "passed": passed,
+                "total": total,
+            },
         )
-    return requirements
 
-
-def seed_agent_library(orchestrator: AssistantOrchestrator, requirements: dict[str, RoleRequirement]) -> None:
-    """Register a simple agent library covering the requested roles."""
-    base_profiles = {
-        "Planner": AgentProfile(
-            agent_id="planner-pro",
-            name="PlannerPro",
-            role="Planner",
-            static_score=StaticScore(performance=0.9, brand=0.8, recognition=0.85),
-            capabilities=AgentCapabilities(
-                skills={"planning", "spec"},
-                tools={"notion", "slack"},
-                domains={"product"},
-            ),
-        ),
-        "Designer": AgentProfile(
-            agent_id="designer-pro",
-            name="UXSpark",
-            role="Designer",
-            static_score=StaticScore(performance=0.88, brand=0.75, recognition=0.82),
-            capabilities=AgentCapabilities(
-                skills={"design", "figma"},
-                tools={"figma"},
-                domains={"web"},
-            ),
-        ),
-        "Dev": AgentProfile(
-            agent_id="dev-fleet",
-            name="DevFleet",
-            role="Dev",
-            static_score=StaticScore(performance=0.92, brand=0.77, recognition=0.8),
-            capabilities=AgentCapabilities(
-                skills={"python", "frontend", "backend"},
-                tools={"docker", "git"},
-                domains={"web", "api"},
-            ),
-        ),
-        "QA": AgentProfile(
-            agent_id="qa-guardian",
-            name="QAGuardian",
-            role="QA",
-            static_score=StaticScore(performance=0.85, brand=0.7, recognition=0.78),
-            capabilities=AgentCapabilities(
-                skills={"testing", "automation"},
-                tools={"pytest"},
-                domains={"web"},
-            ),
-        ),
-    }
-    fallback = base_profiles["Dev"]
-
-    for requirement in requirements.values():
-        role = requirement.role
-        profile = base_profiles.get(role)
-        if profile is None:
-            profile = AgentProfile(
-                agent_id=f"{role.lower()}-auto",
-                name=f"{role}Auto",
-                role=role,
-                static_score=fallback.static_score,
-                capabilities=AgentCapabilities(
-                    skills=set(fallback.capabilities.skills),
-                    tools=set(fallback.capabilities.tools),
-                    domains=set(fallback.capabilities.domains),
-                    languages=set(fallback.capabilities.languages),
-                    regions=set(fallback.capabilities.regions),
-                    compliance_tags=set(fallback.capabilities.compliance_tags),
-                    certifications=set(fallback.capabilities.certifications),
-                ),
+        print("\n[QA]")
+        for item in criteria:
+            status = "✅" if item.get("pass") else "❌"
+            print(
+                f"{status} {item.get('name')}: {item.get('reason')} | 建议: {item.get('recommendation')}",
             )
-        orchestrator.register_candidates(role, [profile])
+        print(f"Round {round_index} 通过率: {passed}/{total} = {pass_ratio:.2%}")
+
+        if pass_ratio >= overall_target:
+            print("验收达标，结束迭代。")
+            break
+
+        failing = [
+            f"- {item.get('name')}: {item.get('recommendation')}"
+            for item in criteria
+            if not item.get("pass")
+        ]
+        feedback = "\n".join(failing)
+        print("需要改进：\n", feedback)
+
+    return {
+        "rounds": rounds,
+        "final_pass_ratio": rounds[-1]["pass_ratio"],
+        "final_deliverable": rounds[-1]["developer"],
+        "final_qa": rounds[-1]["qa"],
+    }
 
 
-async def run_cli(
-    initial_requirement: str,
-    scripted_answers: list[str] | None = None,
-) -> None:
+# ---------------------------------------------------------------------------
+# CLI 主流程
+# ---------------------------------------------------------------------------
+
+async def run_cli(initial_requirement: str, scripted_answers: list[str] | None = None) -> None:
     creds = load_siliconflow_env()
     llm = OpenAIChatModel(
         model_name=creds["model"],
@@ -223,106 +358,35 @@ async def run_cli(
     )
 
     spec = await gather_spec(llm, initial_requirement, scripted_answers)
-    requirements = build_requirements(spec)
-    acceptance = AcceptanceCriteria(
-        description=spec.get("summary", "HiveCore 验收"),
-        metrics={"quality": spec.get("acceptance", {}).get("quality", 0.85)},
+    result = await run_collaboration(llm, spec)
+
+    print("\n========== 最终交付 ==========")
+    print(result["final_deliverable"])
+
+    final_qa = result["final_qa"]
+    criteria = final_qa.get("criteria", [])
+    print("\n========== 验收结果 ==========")
+    for item in criteria:
+        status = "通过" if item.get("pass") else "不通过"
+        print(f"{item.get('name')}: {status} — {item.get('reason')}")
+    print(
+        f"整体通过率: {result['rounds'][-1]['passed']}/{result['rounds'][-1]['total']} "
+        f"= {result['final_pass_ratio']:.2%}",
     )
-    artifact_type = spec.get("artifact_type", "web")
-
-    registry = SystemRegistry()
-    orchestrator = AssistantOrchestrator(system_registry=registry)
-    seed_agent_library(orchestrator, requirements)
-
-    project_pool = ProjectPool()
-    project_pool.register(
-        ProjectDescriptor(
-            project_id="proj-cli",
-            name=spec.get("project_name", "CLI Project"),
-            metadata={"source": "cli"},
-        ),
-    )
-    memory_pool = MemoryPool()
-    resource_library = ResourceLibrary()
-    kpi_tracker = KPITracker(target_reduction=0.85)
-    broadcast_sink = InMemoryMsgHub()
-    delivery_manager = ArtifactDeliveryManager([WebDeployAdapter(), MediaPackageAdapter()])
-
-    executor = ExecutionLoop(
-        project_pool=project_pool,
-        memory_pool=memory_pool,
-        resource_library=resource_library,
-        orchestrator=orchestrator,
-        task_graph_builder=TaskGraphBuilder(),
-        kpi_tracker=kpi_tracker,
-        msg_hub_factory=lambda _project_id: broadcast_sink,
-        delivery_manager=delivery_manager,
-        max_rounds=3,
-    )
-
-    memory_store = AAMemoryStore()
-    user_profile = UserProfile(user_id="cli-user")
-    registry.register_user(user_profile, "aa-cli")
-
-    requirement_resolver = lambda _: requirements
-    acceptance_resolver = lambda _: acceptance
-
-    metrics_resolver = lambda _: (120.0, 260.0, 120.0, 200.0)
-
-    agent = AASystemAgent(
-        name="HiveCore-AA",
-        user_id="cli-user",
-        orchestrator=orchestrator,
-        execution_loop=executor,
-        requirement_resolver=requirement_resolver,
-        acceptance_resolver=acceptance_resolver,
-        metrics_resolver=metrics_resolver,
-        project_resolver=lambda _: "proj-cli",
-        user_profile=user_profile,
-        memory_store=memory_store,
-    )
-
-    user_brief = f"{spec.get('project_name','项目')}，需求：{spec.get('summary','')}。"
-    response = await agent.reply(
-        Msg(
-            name="user",
-            role="user",
-            content=user_brief,
-        ),
-    )
-
-    print("\n========== AA 最终回复 ==========")
-    print(response.get_text_content())
-    if response.metadata.get("deliverable"):
-        print("\n交付结果：", response.metadata["deliverable"])
-
-    print("\n========== 广播快照 ==========")
-    for update in broadcast_sink.updates:
-        print(f"[Round {update.round_index}] {update.summary}")
-
-    print("\n========== 项目记忆摘要 ==========")
-    for entry in memory_pool.query_by_tag("project:proj-cli"):
-        print(entry.content)
-
-    print("\n========== KPI 记录 ==========")
-    for record in kpi_tracker.records:
-        print(
-            f"成本优化: {record.cost_reduction:.0%}, 时长优化: {record.time_reduction:.0%}",
-        )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="HiveCore 用户流程 CLI 演示")
+    parser = argparse.ArgumentParser(description="HiveCore 用户全流程 CLI")
     parser.add_argument(
         "--requirement",
         "-r",
         dest="requirement",
-        help="初始需求说明（可选，默认交互输入）",
+        help="初始需求描述（未提供则交互输入）",
     )
     parser.add_argument(
         "--auto-answers",
         dest="auto_answers",
-        help="使用 '||' 分隔的预设回答序列，便于自动化测试",
+        help="使用 '||' 分隔的预设回答，方便自动化测试",
     )
     args = parser.parse_args()
     requirement = args.requirement or input("请输入你的项目需求：").strip()

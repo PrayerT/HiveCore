@@ -95,6 +95,21 @@ HiveCore 添加的 AA、规划/验收、项目上下文与 MsgHub 等组件构�
 - 规划器可观测性面板 + 插件 API，方便第三方扩展。
 - 多项目视图与跨项目知识同步。
 
+## 🧪 端到端 CLI 演示
+
+- 脚本：`scripts/full_user_flow_cli.py`
+- 环境：在 `~/agentscope/.env` 配置 `SILICONFLOW_API_KEY`、`SILICONFLOW_BASE_URL`、`SILICONFLOW_MODEL`。
+- 流程：
+  1. AA 调用真实 LLM 与用户多轮对话，直至产出包含详尽验收标准的 `READY::JSON`。
+  2. Planner / Designer / Developer / QA 四个 Agent 逐个调用 LLM 协同工作，每轮都会输出真实文案、实现计划与评审结果，不含任何写死数据。
+  3. QA 对每条验收标准给出 JSON 判定，按 “通过条数 / 总条数” 计算通过率，不达标则携带反馈进入下一轮。
+- 示例：
+  ```bash
+  python scripts/full_user_flow_cli.py \
+    -r "我要一个展示新品发布的单页网站，包含报名表单" \
+    --auto-answers "新品是AI智能手表||主要面向科技媒体及核心用户||报名需要姓名、邮箱、媒体名称"
+  ```
+
 ---
 
 ## 🔁 用户流程

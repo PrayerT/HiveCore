@@ -95,6 +95,21 @@ HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of A
 - Planner observability dashboards + plugin APIs for third-party extensions.
 - Multi-project portfolio view with cross-project knowledge sync.
 
+## 🧪 End-to-End CLI Demo
+
+- Script: `scripts/full_user_flow_cli.py`
+- Requirements: `~/agentscope/.env` must provide `SILICONFLOW_API_KEY`, `SILICONFLOW_BASE_URL`, `SILICONFLOW_MODEL`.
+- Flow:
+  1. AA uses the real LLM to negotiate requirements until it emits a `READY::JSON` spec with fine-grained acceptance criteria.
+  2. Planner / Designer / Developer / QA agents each call the LLM, share context, and log their outputs per round—no mock data involved.
+  3. QA returns a JSON verdict for every criterion; the loop continues until the pass ratio (passed/total) satisfies the target.
+- Example:
+  ```bash
+  python scripts/full_user_flow_cli.py \
+    -r "我要一个展示新品发布的单页网站，包含报名表单" \
+    --auto-answers "新品是AI智能手表||主要面向科技媒体及核心用户||报名需要姓名、邮箱、媒体名称"
+  ```
+
 ---
 
 ## 🔁 User Flow
