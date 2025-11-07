@@ -100,14 +100,15 @@ HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of A
 - Script: `scripts/full_user_flow_cli.py`
 - Requirements: `~/agentscope/.env` must provide `SILICONFLOW_API_KEY`, `SILICONFLOW_BASE_URL`, `SILICONFLOW_MODEL`.
 - Flow:
-  1. AA uses the real LLM to negotiate requirements until it emits a `READY::JSON` spec with fine-grained acceptance criteria.
-  2. Planner / Designer / Developer / QA agents each call the LLM, share context, and log their outputs per round—no mock data involved.
-  3. QA returns a JSON verdict for every criterion; the loop continues until the pass ratio (passed/total) satisfies the target.
+  1. AA 多轮澄清，每轮都会输出完整的 `requirements + acceptance_map`，并等待用户输入 `confirm/确认`（无人值守可加 `--auto-confirm`）。没有确认信号就不会进入执行阶段。
+  2. 执行阶段按需求拆分：Planner / Designer / Developer / QA 分别调用 LLM 生成 Blueprint、真实交付内容（HTML/API 规格/脚本等）和验收日志，交付文件保存在 `deliverables/<需求ID>.ext`。
+  3. QA 逐条返回 JSON 判定（pass/fail + reason + recommendation），统计 “通过条数 / 总条数”。若任一需求未达设定阈值（默认 95%），系统会携反馈进入下一轮。
 - Example:
   ```bash
   python scripts/full_user_flow_cli.py \
     -r "我要一个展示新品发布的单页网站，包含报名表单" \
-    --auto-answers "新品是AI智能手表||主要面向科技媒体及核心用户||报名需要姓名、邮箱、媒体名称"
+    --auto-answers "全球媒体||移动优先||confirm" \
+    --auto-confirm
   ```
 
 ---
