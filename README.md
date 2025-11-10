@@ -102,13 +102,18 @@ HiveCore layers (AA, planner/evaluator, project context, MsgHub) sit on top of A
 - Flow:
   1. AA 多轮澄清，每轮都会输出完整的 `requirements + acceptance_map`，并等待用户输入 `confirm/确认`（无人值守可加 `--auto-confirm`）。没有确认信号就不会进入执行阶段。
   2. 执行阶段按需求拆分：Planner / Designer / Developer / QA 分别调用 LLM 生成 Blueprint、真实交付内容（HTML/API 规格/脚本等）和验收日志，交付文件保存在 `deliverables/<需求ID>.ext`。
-  3. QA 逐条返回 JSON 判定（pass/fail + reason + recommendation），统计 “通过条数 / 总条数”。若任一需求未达设定阈值（默认 95%），系统会携反馈进入下一轮。
+  3. QA 逐条返回 JSON 判定（pass/fail + reason + recommendation + checklist 评审），统计 “通过条数 / 总条数”。若任一需求未达设定阈值（默认 95%），系统会携反馈进入下一轮。
+- Provider switch:
+  - 默认 `--provider auto`：若检测到硅基流动配置则走其 API，否则自动回退至本地 Ollama。
+  - 强制本地 Ollama：`--provider ollama --ollama-model qwen3:30b --ollama-host http://localhost:11434`
+  - 强制硅基流动：`--provider siliconflow`（需提前配置 `SILICONFLOW_*` 环境变量）。
 - Example:
   ```bash
   python scripts/full_user_flow_cli.py \
     -r "我要一个展示新品发布的单页网站，包含报名表单" \
     --auto-answers "全球媒体||移动优先||confirm" \
-    --auto-confirm
+    --auto-confirm \
+    --provider ollama --ollama-model qwen3:30b
   ```
 
 ---

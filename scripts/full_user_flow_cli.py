@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from agentscope.model import OpenAIChatModel
+from agentscope.model import OpenAIChatModel, OllamaChatModel
 
 DELIVERABLE_DIR = Path("deliverables")
 
@@ -33,24 +33,72 @@ def load_siliconflow_env() -> dict[str, str]:
                     continue
                 key, value = line.split("=", 1)
                 os.environ.setdefault(key.strip(), value.strip())
-    required = ("SILICONFLOW_API_KEY", "SILICONFLOW_BASE_URL", "SILICONFLOW_MODEL")
-    missing = [k for k in required if not os.environ.get(k)]
-    if missing:
-        raise RuntimeError(f"缺少环境变量: {', '.join(missing)}")
-    return {
-        "api_key": os.environ["SILICONFLOW_API_KEY"],
-        "base_url": os.environ["SILICONFLOW_BASE_URL"],
-        "model": os.environ["SILICONFLOW_MODEL"],
-    }
+    creds = {}
+    for key in ("SILICONFLOW_API_KEY", "SILICONFLOW_BASE_URL", "SILICONFLOW_MODEL"):
+        if os.environ.get(key):
+            creds[key] = os.environ[key]
+    return creds
+
+
+def initialize_llm(
+    provider: str,
+    silicon_creds: dict[str, str],
+    *,
+    ollama_model: str,
+    ollama_host: str,
+):
+    have_silicon = all(key in silicon_creds for key in ("SILICONFLOW_API_KEY", "SILICONFLOW_MODEL"))
+    provider = provider.lower()
+
+    if provider == "siliconflow":
+        if not have_silicon:
+            raise RuntimeError("未检测到硅基流动配置，请在 ~/agentscope/.env 设置相关变量。")
+        return OpenAIChatModel(
+            model_name=silicon_creds["SILICONFLOW_MODEL"],
+            api_key=silicon_creds["SILICONFLOW_API_KEY"],
+            stream=False,
+            client_args={
+                "base_url": silicon_creds.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"),
+            },
+        ), "siliconflow"
+
+    if provider == "ollama":
+        return (
+            OllamaChatModel(
+                model_name=ollama_model,
+                stream=False,
+                host=ollama_host,
+            ),
+            "ollama",
+        )
+
+    if have_silicon:
+        return initialize_llm(
+            "siliconflow",
+            silicon_creds,
+            ollama_model=ollama_model,
+            ollama_host=ollama_host,
+        )
+    return initialize_llm(
+        "ollama",
+        silicon_creds,
+        ollama_model=ollama_model,
+        ollama_host=ollama_host,
+    )
 
 
 async def call_llm_raw(
-    llm: OpenAIChatModel,
+    llm: Any,
     messages: list[dict[str, str]],
     *,
     temperature: float = 0.3,
 ) -> str:
-    resp = await llm(messages, stream=False, temperature=temperature)
+    kwargs = {"stream": False}
+    if isinstance(llm, OllamaChatModel):
+        kwargs["options"] = {"temperature": temperature}
+    else:
+        kwargs["temperature"] = temperature
+    resp = await llm(messages, **kwargs)
     return "".join(
         block.get("text", "")
         for block in resp.content
@@ -59,7 +107,7 @@ async def call_llm_raw(
 
 
 async def call_llm_json(
-    llm: OpenAIChatModel,
+    llm: Any,
     base_messages: list[dict[str, str]],
     *,
     temperature: float = 0.3,
@@ -200,27 +248,48 @@ async def enrich_acceptance_map(llm: OpenAIChatModel, spec: dict[str, Any]) -> N
     spec["acceptance_map"] = list(cleaned_map.values())
     mapping = cleaned_map
 
+    def determine_standard_count(requirement: dict[str, Any]) -> int:
+        text = " ".join(str(requirement.get(k, "")) for k in ("title", "type", "details"))
+        base = 10
+        if any(keyword in text.lower() for keyword in ["全站", "平台", "后台", "app", "系统", "自动化"]):
+            base = 14
+        return base
+
     for req in reqs:
         rid = req["id"]
-        criteria = mapping.setdefault(rid, {"requirement_id": rid, "criteria": []})["criteria"]
-        if len(criteria) >= 5:
-            continue
+        min_count = determine_standard_count(req)
+        entry = mapping.setdefault(rid, {"requirement_id": rid, "criteria": []})
         prompt = textwrap.dedent(
             f"""
             需求:
             {json.dumps(req, ensure_ascii=False, indent=2)}
 
-            请输出 JSON:
+            请基于该需求输出 JSON:
             {{
-              "criteria": [
-                {{"id":"{rid}-C1","description":"...","target":0.95}},
-                ...
+              "standards": [
+                {{
+                  "id": "{rid}.1",
+                  "title": "子标准标题",
+                  "description": "对需求的具体补充说明，必须可验证",
+                  "category": "内容/交互/性能/安全/数据/可观测性/国际化/运维/合规 等分类之一",
+                  "checklist": [
+                    {{"item": "检查项1", "method": "如何验证"}},
+                    {{"item": "检查项2", "method": "如何验证"}},
+                    {{"item": "检查项3", "method": "如何验证"}}
+                  ],
+                  "target": 0.95
+                }}
               ]
             }}
-            至少 5 条，覆盖内容/交互/性能/可观测性/数据准确性/安全/可扩展性等不同维度，描述要具体可验证。
+
+            要求:
+            - 使用层级编号，例如 {rid}.1, {rid}.2, {rid}.3 ...；若需求本身已有编号，可在小数位继续延伸。
+            - 至少 {min_count} 条，且必须覆盖内容、交互、性能、安全、数据准确性、可观测性、国际化/多语言、权限/合规、可扩展性/运维等不同角度。
+            - checklist 中至少 3 个检查项，每个包含 item + method。
+            - 标准描述必须明确“如何判断通过/不通过”，避免泛泛而谈。
             """,
         )
-        raw = await call_llm_raw(
+        data, _ = await call_llm_json(
             llm,
             [
                 {
@@ -231,8 +300,8 @@ async def enrich_acceptance_map(llm: OpenAIChatModel, spec: dict[str, Any]) -> N
             ],
             temperature=0.25,
         )
-        data = parse_json_from_text(raw)
-        criteria[:] = data.get("criteria", criteria)
+        standards = data.get("standards") or data.get("criteria") or []
+        entry["criteria"] = standards
 
 
 def criteria_for_requirement(spec: dict[str, Any], rid: str) -> list[dict[str, Any]]:
@@ -374,7 +443,10 @@ async def qa_requirement(
               "name": "...",
               "pass": true/false,
               "reason": "...",
-              "recommendation": "..."
+              "recommendation": "...",
+              "checklist_review": [
+                 {{"item": "原 checklist 内容", "pass": true/false, "remark": "逐项说明"}}
+              ]
             }}
           ],
           "improvements": "如果未通过，需要改进什么"
@@ -416,7 +488,9 @@ async def run_execution(llm: OpenAIChatModel, spec: dict[str, Any], max_rounds: 
             criteria = criteria_for_requirement(spec, rid)
 
             blueprint = await design_requirement(llm, requirement, feedback_map[rid])
+            print(f"\n[{rid}] Blueprint 摘要：{blueprint.get('deliverable_pitch', '')}")
             impl = await implement_requirement(llm, requirement, blueprint, feedback_map[rid])
+            print(f"[{rid}] Developer Summary：{impl.get('summary', '')}")
 
             DELIVERABLE_DIR.mkdir(parents=True, exist_ok=True)
             ext = impl.get("artifact_extension", "txt").lstrip(".")
@@ -435,6 +509,7 @@ async def run_execution(llm: OpenAIChatModel, spec: dict[str, Any], max_rounds: 
                 criteria=criteria,
                 round_index=round_idx,
             )
+            print(f"[{rid}] QA 判定共 {len(qa_report.get('criteria', []))} 条标准")
 
             crit = qa_report.get("criteria", [])
             passed = sum(1 for item in crit if item.get("pass"))
@@ -483,14 +558,18 @@ async def run_cli(
     initial_requirement: str,
     scripted_inputs: list[str] | None = None,
     auto_confirm: bool = False,
+    provider: str = "auto",
+    ollama_model: str = "qwen3:30b",
+    ollama_host: str = "http://localhost:11434",
 ) -> None:
-    creds = load_siliconflow_env()
-    llm = OpenAIChatModel(
-        model_name=creds["model"],
-        api_key=creds["api_key"],
-        stream=False,
-        client_args={"base_url": creds["base_url"]},
+    silicon_creds = load_siliconflow_env()
+    llm, provider_used = initialize_llm(
+        provider,
+        silicon_creds,
+        ollama_model=ollama_model,
+        ollama_host=ollama_host,
     )
+    print(f"使用 LLM 提供方: {provider_used}")
 
     spec = await collect_spec(llm, initial_requirement, scripted_inputs, auto_confirm)
     await enrich_acceptance_map(llm, spec)
@@ -523,11 +602,28 @@ def main() -> None:
     parser.add_argument("-r", "--requirement", dest="requirement", help="初始需求描述")
     parser.add_argument("--auto-answers", dest="auto_answers", help="使用 '||' 分隔的自动输入（含 confirm）")
     parser.add_argument("--auto-confirm", dest="auto_confirm", action="store_true", help="自动确认需求（适用于无人值守测试）")
+    parser.add_argument(
+        "--provider",
+        choices=["auto", "siliconflow", "ollama"],
+        default="auto",
+        help="选择 LLM 提供方，auto 表示优先使用硅基流动，否则回退到本地 Ollama",
+    )
+    parser.add_argument("--ollama-model", dest="ollama_model", default="qwen3:30b", help="Ollama 模型名称")
+    parser.add_argument("--ollama-host", dest="ollama_host", default="http://localhost:11434", help="Ollama 服务地址")
     args = parser.parse_args()
 
     requirement = args.requirement or input("请输入你的项目需求：").strip()
     scripted = parse_auto_inputs(args.auto_answers)
-    asyncio.run(run_cli(requirement, scripted, args.auto_confirm))
+    asyncio.run(
+        run_cli(
+            requirement,
+            scripted,
+            args.auto_confirm,
+            provider=args.provider,
+            ollama_model=args.ollama_model,
+            ollama_host=args.ollama_host,
+        ),
+    )
 
 
 if __name__ == "__main__":
