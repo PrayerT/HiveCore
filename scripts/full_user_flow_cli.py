@@ -10,14 +10,427 @@ import json
 import os
 import re
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from agentscope.aa import AgentCapabilities, AgentProfile, RoleRequirement, StaticScore
+from agentscope.message import Msg
 from agentscope.model import OpenAIChatModel, OllamaChatModel
+from agentscope.mcp import HttpStatelessClient
+from agentscope.ones import (
+    AASystemAgent,
+    AcceptanceCriteria,
+    AssistantOrchestrator,
+    ArtifactDeliveryManager,
+    ExecutionLoop,
+    InMemoryMsgHub,
+    KPITracker,
+    MemoryPool,
+    ProjectPool,
+    ResourceHandle,
+    ResourceLibrary,
+    SystemRegistry,
+    TaskGraphBuilder,
+    UserProfile,
+    WebDeployAdapter,
+)
+from agentscope.ones.storage import AAMemoryStore
 
 DELIVERABLE_DIR = Path("deliverables")
+MCP_SUMMARY_MAX_TOOLS = 5
+
+
+@dataclass
+class MCPServerConfig:
+    name: str
+    transport: str
+    url: str
+
+
+@dataclass
+class RuntimeHarness:
+    orchestrator: AssistantOrchestrator
+    execution_loop: ExecutionLoop
+    registry: SystemRegistry
+    project_pool: ProjectPool
+    memory_pool: MemoryPool
+    resource_library: ResourceLibrary
+    msg_hub: InMemoryMsgHub | None
+    kpi_tracker: KPITracker
+    aa_agent: AASystemAgent
+    project_id: str
+    resource_handles: list[ResourceHandle] = field(default_factory=list)
+
+
+def parse_mcp_server(value: str) -> MCPServerConfig:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if len(parts) == 2:
+        name, url = parts
+        transport = "streamable_http"
+    elif len(parts) == 3:
+        name, transport, url = parts
+    else:
+        raise ValueError(
+            "MCP server格式应为 'name,url' 或 'name,transport,url'",
+        )
+    if not name or not url:
+        raise ValueError("MCP server 参数缺少 name 或 url")
+    return MCPServerConfig(name=name, transport=transport, url=url)
+
+
+def build_mcp_clients(configs: list[MCPServerConfig] | None) -> list[HttpStatelessClient]:
+    clients: list[HttpStatelessClient] = []
+    for cfg in configs or []:
+        transport = cfg.transport.strip().lower()
+        if transport not in {"streamable_http", "sse"}:
+            print(f"[WARN] MCP {cfg.name} 使用未知 transport {cfg.transport}，默认 streamable_http")
+            transport = "streamable_http"
+        try:
+            client = HttpStatelessClient(
+                name=cfg.name,
+                transport=transport,  # type: ignore[arg-type]
+                url=cfg.url,
+            )
+        except Exception as exc:
+            print(f"[WARN] 初始化 MCP 客户端 {cfg.name} 失败: {exc}")
+            continue
+        clients.append(client)
+    return clients
+
+
+async def summarize_mcp_clients(
+    clients: list[HttpStatelessClient],
+) -> tuple[str, list[ResourceHandle]]:
+    lines: list[str] = []
+    handles: list[ResourceHandle] = []
+    for client in clients:
+        try:
+            tools = await client.list_tools()
+        except Exception as exc:
+            lines.append(f"{client.name} ({client.transport}) 工具获取失败: {exc}")
+            metadata = {"error": str(exc)}
+        else:
+            lines.append(f"{client.name} ({client.transport}) 可用工具 {len(tools)} 个:")
+            for tool in tools[:MCP_SUMMARY_MAX_TOOLS]:
+                lines.append(f"  - {tool.name}: {tool.description}")
+            remaining = len(tools) - MCP_SUMMARY_MAX_TOOLS
+            if remaining > 0:
+                lines.append(f"  - ... 其余 {remaining} 个工具省略")
+            metadata = {
+                "transport": client.transport,
+                "tool_count": str(len(tools)),
+                "tools_preview": ", ".join(tool.name for tool in tools[:MCP_SUMMARY_MAX_TOOLS]),
+            }
+        uri = ""
+        if hasattr(client, "client_config"):
+            uri = client.client_config.get("url", "")
+        handle = ResourceHandle(
+            identifier=f"mcp::{client.name}",
+            type="mcp",
+            uri=uri,
+            tags={"mcp", client.transport},
+            metadata=metadata,
+        )
+        handles.append(handle)
+    summary = "\n".join(lines).strip()
+    return summary, handles
+
+
+def _profile(
+    *,
+    agent_id: str,
+    role: str,
+    skills: set[str],
+    tools: set[str],
+    domains: set[str],
+) -> AgentProfile:
+    return AgentProfile(
+        agent_id=agent_id,
+        name=agent_id.replace("_", " ").title(),
+        role=role,
+        static_score=StaticScore(
+            performance=0.82,
+            brand=0.78,
+            recognition=0.75,
+        ),
+        capabilities=AgentCapabilities(
+            skills=skills,
+            tools=tools,
+            domains=domains,
+            languages={"zh", "en"},
+            regions={"global"},
+            compliance_tags={"standard"},
+            certifications={"iso9001"},
+        ),
+    )
+
+
+def default_agent_profiles() -> dict[str, list[AgentProfile]]:
+    catalog = {
+        "Strategy": [
+            _profile(
+                agent_id="strategy_chief",
+                role="Strategy",
+                skills={"roadmap", "ops"},
+                tools={"miro", "dovetail"},
+                domains={"platform"},
+            ),
+        ],
+        "Product": [
+            _profile(
+                agent_id="product_lead",
+                role="Product",
+                skills={"mvp", "sla"},
+                tools={"notion", "figjam"},
+                domains={"experience"},
+            ),
+        ],
+        "Builder": [
+            _profile(
+                agent_id="builder_core",
+                role="Builder",
+                skills={"ai", "automation"},
+                tools={"python", "bash"},
+                domains={"delivery"},
+            ),
+        ],
+        "Frontend": [
+            _profile(
+                agent_id="frontend_crafter",
+                role="Frontend",
+                skills={"web", "react"},
+                tools={"vite", "tailwind"},
+                domains={"experience"},
+            ),
+        ],
+        "Backend": [
+            _profile(
+                agent_id="backend_foundry",
+                role="Backend",
+                skills={"api", "infra"},
+                tools={"fastapi", "docker"},
+                domains={"platform"},
+            ),
+        ],
+        "Ux": [
+            _profile(
+                agent_id="ux_curator",
+                role="Ux",
+                skills={"research", "wireframe"},
+                tools={"figma"},
+                domains={"experience"},
+            ),
+        ],
+        "QA": [
+            _profile(
+                agent_id="qa_guardian",
+                role="QA",
+                skills={"test", "monitor"},
+                tools={"pytest", "playwright"},
+                domains={"quality"},
+            ),
+        ],
+    }
+    return catalog
+
+
+def _contains_any(text: str, keywords: list[str]) -> bool:
+    lowered = text.lower()
+    return any(word in lowered for word in keywords)
+
+
+def infer_role(requirement: dict[str, Any]) -> str:
+    text = " ".join(
+        str(requirement.get(key, "")) for key in ("title", "type", "details")
+    ).lower()
+    if _contains_any(text, ["策略", "roadmap", "规划"]):
+        return "Strategy"
+    if _contains_any(text, ["产品", "业务", "mvp", "slo", "sla"]):
+        return "Product"
+    if _contains_any(text, ["体验", "交互", "设计", "ux", "ui"]):
+        return "Ux"
+    if _contains_any(text, ["前端", "web", "页面", "h5", "组件"]):
+        return "Frontend"
+    if _contains_any(text, ["后端", "api", "service", "服务", "数据", "pipeline"]):
+        return "Backend"
+    if _contains_any(text, ["测试", "验收", "质量", "qa", "监控"]):
+        return "QA"
+    return "Builder"
+
+
+def _infer_tags(requirement: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
+    text = " ".join(
+        str(requirement.get(key, "")) for key in ("title", "type", "details")
+    ).lower()
+    skills: set[str] = set()
+    tools: set[str] = set()
+    domains: set[str] = set()
+    if _contains_any(text, ["ai", "llm", "agent"]):
+        skills.add("ai")
+        tools.add("python")
+        domains.add("ai")
+    if _contains_any(text, ["web", "页面", "h5", "landing"]):
+        skills.add("web")
+        tools.add("react")
+        domains.add("experience")
+    if _contains_any(text, ["api", "service", "接口", "微服务"]):
+        skills.add("api")
+        tools.add("fastapi")
+        domains.add("platform")
+    if _contains_any(text, ["测试", "验收", "监控", "qa"]):
+        skills.add("qa")
+        tools.add("pytest")
+        domains.add("quality")
+    if _contains_any(text, ["数据", "分析", "etl", "pipeline"]):
+        skills.add("data")
+        tools.add("spark")
+        domains.add("data")
+    if not skills:
+        skills.add("generalist")
+    if not tools:
+        tools.add("notion")
+    if not domains:
+        domains.add("delivery")
+    return skills, tools, domains
+
+
+def build_runtime_requirements(spec: dict[str, Any]) -> dict[str, RoleRequirement]:
+    requirements: dict[str, RoleRequirement] = {}
+    for req in spec.get("requirements", []):
+        rid = req.get("id") or sanitize_filename(req.get("title", "R"))
+        role = infer_role(req)
+        skills, tools, domains = _infer_tags(req)
+        requirement = RoleRequirement(
+            role=role,
+            skills=skills,
+            tools=tools,
+            domains=domains,
+            languages={"zh", "en"},
+            regions={"global"},
+            notes=req.get("details"),
+        )
+        requirements[rid] = requirement
+    if not requirements:
+        requirements["R1"] = RoleRequirement(
+            role="Builder",
+            skills={"generalist"},
+            tools={"notion"},
+            domains={"delivery"},
+        )
+    return requirements
+
+
+def build_runtime_acceptance(spec: dict[str, Any]) -> AcceptanceCriteria:
+    config = spec.get("acceptance", {}) or {}
+    target = config.get("overall_target")
+    if target is None:
+        collected: list[float] = []
+        for mapping in spec.get("acceptance_map", []):
+            for criterion in mapping.get("criteria", []):
+                try:
+                    value = float(criterion.get("target"))
+                except (TypeError, ValueError):
+                    continue
+                collected.append(value)
+        if collected:
+            target = min(max(min(collected), 0.5), 0.99)
+        else:
+            target = 0.9
+    target = float(target)
+    return AcceptanceCriteria(
+        description="HiveCore CLI 自动验收",
+        metrics={"quality": target},
+    )
+
+
+def compute_runtime_metrics(spec: dict[str, Any]) -> tuple[float, float, float, float]:
+    count = max(len(spec.get("requirements", [])), 1)
+    baseline_cost = 120.0 * count
+    observed_cost = baseline_cost * 0.65
+    baseline_time = 80.0 * count
+    observed_time = baseline_time * 0.6
+    return (baseline_cost, observed_cost, baseline_time, observed_time)
+
+
+def derive_project_id(spec: dict[str, Any], hint: str | None) -> str:
+    base = hint or spec.get("summary") or "hivecore_project"
+    return sanitize_filename(base)[:24] or "hivecore_project"
+
+
+def build_runtime_harness(
+    spec: dict[str, Any],
+    *,
+    user_id: str,
+    project_hint: str | None,
+    resource_handles: list[ResourceHandle],
+) -> RuntimeHarness:
+    registry = SystemRegistry()
+    orchestrator = AssistantOrchestrator(system_registry=registry)
+    for role, candidates in default_agent_profiles().items():
+        orchestrator.register_candidates(role, candidates)
+
+    project_pool = ProjectPool()
+    memory_pool = MemoryPool()
+    resource_library = ResourceLibrary()
+    for handle in resource_handles:
+        resource_library.register(handle)
+    msg_hub = InMemoryMsgHub()
+    kpi_tracker = KPITracker(target_reduction=0.3)
+    delivery_manager = ArtifactDeliveryManager([WebDeployAdapter()])
+
+    execution_loop = ExecutionLoop(
+        project_pool=project_pool,
+        memory_pool=memory_pool,
+        resource_library=resource_library,
+        orchestrator=orchestrator,
+        task_graph_builder=TaskGraphBuilder(),
+        kpi_tracker=kpi_tracker,
+        msg_hub_factory=lambda _: msg_hub,
+        delivery_manager=delivery_manager,
+    )
+
+    def requirement_resolver(_: str) -> dict[str, RoleRequirement]:
+        return build_runtime_requirements(spec)
+
+    def acceptance_resolver(_: str) -> AcceptanceCriteria:
+        return build_runtime_acceptance(spec)
+
+    def metrics_resolver(_: str) -> tuple[float, float, float, float]:
+        return compute_runtime_metrics(spec)
+
+    project_id = derive_project_id(spec, project_hint)
+
+    def project_resolver(_: str) -> str:
+        return project_id
+
+    user_profile = UserProfile(user_id=user_id)
+    aa_agent = AASystemAgent(
+        name="Hive-AA",
+        user_id=user_id,
+        orchestrator=orchestrator,
+        execution_loop=execution_loop,
+        requirement_resolver=requirement_resolver,
+        acceptance_resolver=acceptance_resolver,
+        metrics_resolver=metrics_resolver,
+        project_resolver=project_resolver,
+        user_profile=user_profile,
+        memory_store=AAMemoryStore(),
+    )
+    return RuntimeHarness(
+        orchestrator=orchestrator,
+        execution_loop=execution_loop,
+        registry=registry,
+        project_pool=project_pool,
+        memory_pool=memory_pool,
+        resource_library=resource_library,
+        msg_hub=msg_hub,
+        kpi_tracker=kpi_tracker,
+        aa_agent=aa_agent,
+        project_id=project_id,
+        resource_handles=resource_handles,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +748,7 @@ async def design_requirement(
     passed_ids: set[str],
     failed_criteria: list[dict[str, Any]],
     prev_blueprint: dict[str, Any] | None,
+    contextual_notes: str | None = None,
 ) -> dict[str, Any]:
     artifact_type = resolve_artifact_type(requirement)
     prompt = textwrap.dedent(
@@ -371,6 +785,8 @@ async def design_requirement(
         输出合法 JSON。
         """
     )
+    if contextual_notes:
+        prompt += "\n共享上下文（Runtime/MCP）:\n" + contextual_notes
     blueprint, _ = await call_llm_json(
         llm,
         [
@@ -390,6 +806,7 @@ async def implement_requirement(
     passed_ids: set[str],
     failed_criteria: list[dict[str, Any]],
     previous_artifact: str,
+    contextual_notes: str | None = None,
 ) -> dict[str, Any]:
     artifact_type = blueprint.get("artifact_spec", {}).get("format") or resolve_artifact_type(requirement)
     prompt = textwrap.dedent(
@@ -424,6 +841,8 @@ async def implement_requirement(
         - 其他格式同理。
         """
     )
+    if contextual_notes:
+        prompt += "\n可引用的 Runtime / MCP 见解:\n" + contextual_notes
     impl, _ = await call_llm_json(
         llm,
         [
@@ -495,7 +914,14 @@ async def qa_requirement(
 # ---------------------------------------------------------------------------
 # 执行与验收
 # ---------------------------------------------------------------------------
-async def run_execution(llm: OpenAIChatModel, spec: dict[str, Any], max_rounds: int = 3) -> dict[str, Any]:
+async def run_execution(
+    llm: OpenAIChatModel,
+    spec: dict[str, Any],
+    max_rounds: int = 3,
+    verbose: bool = False,
+    runtime_summary: str | None = None,
+    mcp_context: str | None = None,
+) -> dict[str, Any]:
     requirements = spec.get("requirements", [])
     overall_target = spec.get("acceptance", {}).get("overall_target", 0.95)
     feedback_map = {req["id"]: "" for req in requirements}
@@ -512,6 +938,12 @@ async def run_execution(llm: OpenAIChatModel, spec: dict[str, Any], max_rounds: 
     }
     rounds: list[dict[str, Any]] = []
     final_paths: dict[str, Path] = {}
+    notes_parts: list[str] = []
+    if runtime_summary:
+        notes_parts.append(f"Runtime 摘要:\n{runtime_summary}")
+    if mcp_context:
+        notes_parts.append(f"MCP 工具概览:\n{mcp_context}")
+    contextual_notes = "\n\n".join(notes_parts)
 
     for round_idx in range(1, max_rounds + 1):
         print(f"\n---- 执行轮次 Round {round_idx} ----")
@@ -553,8 +985,14 @@ async def run_execution(llm: OpenAIChatModel, spec: dict[str, Any], max_rounds: 
                 passed_ids,
                 failed_criteria,
                 state.get("blueprint"),
+                contextual_notes=contextual_notes or None,
             )
             print(f"\n[{rid}] Blueprint 摘要：{blueprint.get('deliverable_pitch', '')}")
+            if verbose:
+                print(
+                    f"[{rid}] Blueprint 详情：\n"
+                    f"{json.dumps(blueprint, ensure_ascii=False, indent=2)}"
+                )
             impl = await implement_requirement(
                 llm,
                 requirement,
@@ -563,8 +1001,14 @@ async def run_execution(llm: OpenAIChatModel, spec: dict[str, Any], max_rounds: 
                 passed_ids,
                 failed_criteria,
                 state.get("artifact", ""),
+                contextual_notes=contextual_notes or None,
             )
             print(f"[{rid}] Developer Summary：{impl.get('summary', '')}")
+            if verbose:
+                print(
+                    f"[{rid}] Developer 输出：\n"
+                    f"{json.dumps(impl, ensure_ascii=False, indent=2)}"
+                )
 
             DELIVERABLE_DIR.mkdir(parents=True, exist_ok=True)
             ext = impl.get("artifact_extension", "txt").lstrip(".")
@@ -592,6 +1036,11 @@ async def run_execution(llm: OpenAIChatModel, spec: dict[str, Any], max_rounds: 
                 round_index=round_idx,
             )
             print(f"[{rid}] QA 判定共 {len(qa_report.get('criteria', []))} 条标准")
+            if verbose:
+                print(
+                    f"[{rid}] QA 输出：\n"
+                    f"{json.dumps(qa_report, ensure_ascii=False, indent=2)}"
+                )
 
             crit = qa_report.get("criteria", [])
             passed = sum(1 for item in crit if item.get("pass"))
@@ -649,6 +1098,10 @@ async def run_cli(
     provider: str = "auto",
     ollama_model: str = "qwen3:30b",
     ollama_host: str = "http://localhost:11434",
+    verbose: bool = False,
+    user_id: str = "cli-user",
+    project_id: str | None = None,
+    mcp_configs: list[MCPServerConfig] | None = None,
 ) -> None:
     silicon_creds = load_siliconflow_env()
     llm, provider_used = initialize_llm(
@@ -661,7 +1114,47 @@ async def run_cli(
 
     spec = await collect_spec(llm, initial_requirement, scripted_inputs, auto_confirm)
     await enrich_acceptance_map(llm, spec)
-    result = await run_execution(llm, spec)
+    mcp_clients = build_mcp_clients(mcp_configs)
+    mcp_context, resource_handles = await summarize_mcp_clients(mcp_clients)
+    runtime = build_runtime_harness(
+        spec,
+        user_id=user_id,
+        project_hint=project_id,
+        resource_handles=resource_handles,
+    )
+    runtime_payload = json.dumps(
+        {
+            "initial_requirement": initial_requirement,
+            "summary": spec.get("summary"),
+            "requirements": spec.get("requirements", []),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    runtime_msg = await runtime.aa_agent.reply(
+        Msg(name=user_id, role="user", content=runtime_payload),
+    )
+    runtime_text = runtime_msg.get_text_content() or ""
+    print("\n========== Hive Runtime (AA) ==========")
+    print(runtime_text or "[无文本]")
+    runtime_meta = runtime_msg.metadata or {}
+    deliverable_meta = runtime_meta.get("deliverable")
+    if deliverable_meta:
+        print(
+            f"Runtime 交付模拟: {deliverable_meta.get('type')} -> "
+            f"{deliverable_meta.get('uri')}",
+        )
+    if mcp_context:
+        print("\n检测到 MCP 资源：")
+        print(mcp_context)
+
+    result = await run_execution(
+        llm,
+        spec,
+        verbose=verbose,
+        runtime_summary=runtime_text,
+        mcp_context=mcp_context or None,
+    )
 
     print("\n========== 最终交付 ==========")
     for rid, path in result["deliverables"].items():
@@ -698,10 +1191,28 @@ def main() -> None:
     )
     parser.add_argument("--ollama-model", dest="ollama_model", default="qwen3:30b", help="Ollama 模型名称")
     parser.add_argument("--ollama-host", dest="ollama_host", default="http://localhost:11434", help="Ollama 服务地址")
+    parser.add_argument("-v", "--verbose", action="store_true", help="打印完整的 Agent 输出内容")
+    parser.add_argument("--user-id", dest="user_id", default="cli-user", help="绑定到 runtime 的用户 ID")
+    parser.add_argument("--project-id", dest="project_id", help="指定项目 ID（若不提供则自动生成）")
+    parser.add_argument(
+        "--mcp-server",
+        dest="mcp_servers",
+        action="append",
+        help="注册 MCP 服务，格式 name,url 或 name,transport,url，可重复使用",
+    )
     args = parser.parse_args()
 
     requirement = args.requirement or input("请输入你的项目需求：").strip()
     scripted = parse_auto_inputs(args.auto_answers)
+    mcp_configs = None
+    if args.mcp_servers:
+        parsed: list[MCPServerConfig] = []
+        for raw in args.mcp_servers:
+            try:
+                parsed.append(parse_mcp_server(raw))
+            except ValueError as exc:
+                print(f"[WARN] 忽略无效 MCP 参数 '{raw}': {exc}")
+        mcp_configs = parsed or None
     asyncio.run(
         run_cli(
             requirement,
@@ -710,6 +1221,10 @@ def main() -> None:
             provider=args.provider,
             ollama_model=args.ollama_model,
             ollama_host=args.ollama_host,
+            verbose=args.verbose,
+            user_id=args.user_id,
+            project_id=args.project_id,
+            mcp_configs=mcp_configs,
         ),
     )
 

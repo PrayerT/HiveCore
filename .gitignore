@@ -147,3 +147,4 @@ docs/tutorial/**/.doctrees/
 hivecore_local/
 hivecore_reports/
 *.hivecore.log
+deliverables/
